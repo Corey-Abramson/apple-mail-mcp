@@ -416,6 +416,58 @@ class TestMigrationV4ToV5:
         assert cursor.fetchone()[0] == SCHEMA_VERSION
 
 
+class TestMigrationV5ToV6:
+    """Tests for v5→v6 persisted account display names."""
+
+    @pytest.fixture
+    def v5_db(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+            CREATE TABLE emails (
+                rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                account TEXT NOT NULL,
+                mailbox TEXT NOT NULL,
+                subject TEXT
+            );
+        """)
+        conn.execute("INSERT INTO schema_version (version) VALUES (5)")
+        conn.execute(
+            "INSERT INTO emails (message_id, account, mailbox, subject) "
+            "VALUES (1, 'UUID-1', 'INBOX', 'Preserve me')"
+        )
+        conn.commit()
+        yield conn
+        conn.close()
+
+    def test_migration_creates_accounts_table_and_index(self, v5_db):
+        _run_migrations(v5_db, 5, SCHEMA_VERSION)
+
+        objects = {
+            (row["type"], row["name"])
+            for row in v5_db.execute(
+                "SELECT type, name FROM sqlite_master "
+                "WHERE name IN ('accounts', 'idx_accounts_name')"
+            )
+        }
+        assert ("table", "accounts") in objects
+        assert ("index", "idx_accounts_name") in objects
+
+    def test_migration_preserves_emails_and_updates_version(self, v5_db):
+        before = v5_db.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
+
+        _run_migrations(v5_db, 5, SCHEMA_VERSION)
+
+        after = v5_db.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
+        version = v5_db.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0]
+        assert before == after == 1
+        assert version == SCHEMA_VERSION
+
+
 class TestInsertAttachments:
     """Tests for the shared insert_attachments() helper."""
 

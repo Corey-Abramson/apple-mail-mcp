@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from apple_mail_mcp.index.accounts import _CACHE_TTL, AccountMap
+from apple_mail_mcp.index.manager import IndexManager
 
 SAMPLE_ACCOUNTS = [
     {"name": "Work", "id": "24E569DF-5E45-4B6A-8E3C-1A2B3C4D5E6F"},
@@ -71,6 +72,41 @@ class TestLoadFromJxa:
         m.load_from_jxa([{"name": "New", "id": "NEW-UUID"}])
         assert m.name_to_uuid("Old") is None
         assert m.name_to_uuid("New") == "NEW-UUID"
+
+    def test_duplicate_display_name_is_not_resolved(self):
+        """A duplicate display name must not select an arbitrary UUID."""
+        m = AccountMap()
+        m.load_from_jxa(
+            [
+                {"name": "Shared", "id": "UUID-1"},
+                {"name": "Shared", "id": "UUID-2"},
+            ]
+        )
+
+        assert m.name_to_uuid("Shared") is None
+        assert len(m.get_cached_accounts() or []) == 2
+
+    @patch("apple_mail_mcp.index.manager.IndexManager.get_instance")
+    def test_persistence_failure_does_not_break_jxa_map(self, get_manager):
+        """A database write failure must not discard a valid live map."""
+        get_manager.side_effect = RuntimeError("database unavailable")
+        m = AccountMap()
+
+        m.load_from_jxa(SAMPLE_ACCOUNTS)
+
+        assert m.name_to_uuid("Work") == SAMPLE_ACCOUNTS[0]["id"]
+
+
+class TestLoadFromDb:
+    """Tests for the persisted, Mail.app-independent map."""
+
+    def test_round_trip_loads_without_jxa(self):
+        manager = IndexManager.get_instance()
+        assert manager.save_account_map(SAMPLE_ACCOUNTS) == 2
+        m = AccountMap()
+
+        assert m.load_from_db() is True
+        assert m.name_to_uuid("Personal") == SAMPLE_ACCOUNTS[1]["id"]
 
 
 class TestNameToUuid:
@@ -147,3 +183,27 @@ class TestEnsureLoaded:
 
         mock_exec.assert_not_called()
         assert m.get_cached_accounts() is None
+
+    @pytest.mark.asyncio
+    @patch("apple_mail_mcp.executor.execute_with_core_async")
+    async def test_uses_persisted_map_before_jxa(self, mock_exec):
+        """A persisted map is sufficient even when JXA is allowed."""
+        IndexManager.get_instance().save_account_map(SAMPLE_ACCOUNTS)
+        m = AccountMap()
+
+        await m.ensure_loaded()
+
+        mock_exec.assert_not_called()
+        assert m.name_to_uuid("Work") == SAMPLE_ACCOUNTS[0]["id"]
+
+    @pytest.mark.asyncio
+    @patch("apple_mail_mcp.executor.execute_with_core_async")
+    async def test_disallows_jxa_but_still_uses_persisted_map(self, mock_exec):
+        """allow_jxa=False blocks Mail.app, not the persisted DB map."""
+        IndexManager.get_instance().save_account_map(SAMPLE_ACCOUNTS)
+        m = AccountMap()
+
+        await m.ensure_loaded(allow_jxa=False)
+
+        mock_exec.assert_not_called()
+        assert m.name_to_uuid("Work") == SAMPLE_ACCOUNTS[0]["id"]

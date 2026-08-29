@@ -15,6 +15,23 @@ from apple_mail_mcp.index.schema import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolate_default_index(monkeypatch, tmp_path: Path):
+    """Keep singleton/default-path tests away from the live mail index."""
+    from apple_mail_mcp.index.manager import IndexManager
+
+    if IndexManager._instance is not None:
+        IndexManager._instance.close()
+    IndexManager._instance = None
+    monkeypatch.setenv(
+        "APPLE_MAIL_INDEX_PATH", str(tmp_path / "default_index.db")
+    )
+    yield
+    if IndexManager._instance is not None:
+        IndexManager._instance.close()
+    IndexManager._instance = None
+
+
 @pytest.fixture
 def temp_db():
     """Create an in-memory database with the schema and standard PRAGMAs."""

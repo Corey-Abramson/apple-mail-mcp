@@ -932,6 +932,46 @@ def cli_accounts() -> None:
         sys.exit(1)
 
 
+@app.command(name="sync-accounts")
+def cli_sync_accounts(
+    account_map: Annotated[
+        str | None,
+        cyclopts.Parameter(
+            name="--map",
+            help="Comma-separated display-name=UUID pairs (skips Mail.app)",
+        ),
+    ] = None,
+) -> None:
+    """Persist the account display-name map for offline indexed reads."""
+    from .index import IndexManager
+
+    try:
+        if account_map is None:
+            from .server import list_accounts
+
+            accounts = _run_async(list_accounts())
+        else:
+            accounts = []
+            for raw_pair in account_map.split(","):
+                pair = raw_pair.strip()
+                if "=" not in pair:
+                    raise ValueError(
+                        "each --map entry must be a display-name=UUID pair"
+                    )
+                name, uid = (part.strip() for part in pair.split("=", 1))
+                if not name or not uid:
+                    raise ValueError(
+                        "each --map entry needs a non-empty name and UUID"
+                    )
+                accounts.append({"name": name, "id": uid})
+
+        persisted = IndexManager.get_instance().save_account_map(accounts)
+        _print_json({"persisted": persisted, "accounts": accounts})
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 @app.command(name="mailboxes")
 def cli_mailboxes(
     account: Annotated[

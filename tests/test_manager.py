@@ -68,6 +68,46 @@ class TestHasIndex:
         assert manager.has_index() is expected
 
 
+class TestAccountMapPersistence:
+    """Tests for the schema-v6 account display-name table."""
+
+    def test_save_and_load_round_trip(self, temp_db_path):
+        manager = IndexManager(db_path=temp_db_path)
+        accounts = [
+            {"name": "Work", "id": "UUID-1"},
+            {"name": "Personal", "id": "UUID-2"},
+        ]
+
+        assert manager.save_account_map(accounts) == 2
+        assert manager.load_account_map() == [
+            {"name": "Personal", "id": "UUID-2"},
+            {"name": "Work", "id": "UUID-1"},
+        ]
+
+    def test_save_skips_incomplete_rows(self, temp_db_path):
+        manager = IndexManager(db_path=temp_db_path)
+
+        persisted = manager.save_account_map(
+            [
+                {"name": "Work", "id": "UUID-1"},
+                {"name": "", "id": "UUID-2"},
+                {"name": "Missing UUID"},
+            ]
+        )
+
+        assert persisted == 1
+        assert manager.load_account_map() == [{"name": "Work", "id": "UUID-1"}]
+
+    def test_save_failure_returns_zero(self, temp_db_path):
+        manager = IndexManager(db_path=temp_db_path)
+        with patch.object(
+            manager, "_get_conn", side_effect=RuntimeError("write failed")
+        ):
+            assert (
+                manager.save_account_map([{"name": "Work", "id": "UUID"}]) == 0
+            )
+
+
 class TestGetStats:
     """Tests for index statistics."""
 

@@ -17,7 +17,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # Current schema version for migrations
-SCHEMA_VERSION = 5  # Bumped for failed_index_jobs (DLQ) support
+SCHEMA_VERSION = 6  # Bumped for persisted account display names
 
 # Default PRAGMAs for all connections (centralized to avoid drift)
 DEFAULT_PRAGMAS = {
@@ -51,6 +51,12 @@ RECORD_PARSE_FAILURE_SQL = """INSERT INTO failed_index_jobs
         attempt_count = attempt_count + 1"""
 
 CLEAR_PARSE_FAILURE_SQL = "DELETE FROM failed_index_jobs WHERE emlx_path = ?"
+
+UPSERT_ACCOUNT_SQL = """INSERT INTO accounts (uuid, name)
+    VALUES (?, ?)
+    ON CONFLICT(uuid) DO UPDATE SET
+        name = excluded.name,
+        updated_at = datetime('now')"""
 
 
 def parse_failure_row(
@@ -268,6 +274,18 @@ CREATE TABLE IF NOT EXISTS failed_index_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_failed_jobs_mailbox
     ON failed_index_jobs(account, mailbox);
+
+-- Account display name <-> UUID map.
+-- Mail.app is the only source of display names (they are not in the
+-- Envelope Index and not on disk), so the map is written through
+-- whenever JXA runs and read back on cold start. This is what lets
+-- indexed reads resolve account filters with Mail.app unavailable.
+CREATE TABLE IF NOT EXISTS accounts (
+    uuid TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_accounts_name ON accounts(name);
 """
 
 
@@ -439,6 +457,23 @@ def _run_migrations(
                 ON failed_index_jobs(account, mailbox);
         """)
         logger.info("Migration v4→v5 complete.")
+
+    if from_version < 6:
+        logger.info("Migrating schema v5→v6: adding accounts table")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS accounts (
+                uuid TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_accounts_name
+                ON accounts(name);
+        """)
+        logger.info(
+            "Migration v5→v6 complete. The table is empty until the next "
+            "JXA-backed account load; run 'apple-mail-mcp accounts' once "
+            "with Mail.app running to populate it."
+        )
 
     conn.execute("UPDATE schema_version SET version = ?", (to_version,))
     conn.commit()

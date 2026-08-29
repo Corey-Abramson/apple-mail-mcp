@@ -38,6 +38,8 @@ class AccountMap:
     def __init__(self) -> None:
         self._name_to_uuid: dict[str, str] = {}
         self._uuid_to_name: dict[str, str] = {}
+        self._ambiguous_names: set[str] = set()
+        self._source: str | None = None
         self._loaded_at: float = 0
         self._lock = threading.Lock()
         self._async_lock = asyncio.Lock()
@@ -76,11 +78,13 @@ class AccountMap:
                 self._name_to_uuid[n] for n in names if n in self._name_to_uuid
             }
             unknown = {n for n in names if n not in self._name_to_uuid}
+            source = self._source or "unloaded"
         if unknown:
             logger.warning(
                 "Account exclusion: no account named %s; not hidden. "
-                "Names are exact and case-sensitive.",
+                "Names are exact and case-sensitive (map source: %s).",
                 ", ".join(sorted(repr(n) for n in unknown)),
+                source,
             )
         return resolved
 
@@ -89,6 +93,8 @@ class AccountMap:
         with self._lock:
             self._name_to_uuid.clear()
             self._uuid_to_name.clear()
+            self._ambiguous_names.clear()
+            self._source = None
             self._loaded_at = 0
 
     def get_cached_accounts(self) -> list[dict[str, str]] | None:
@@ -106,7 +112,7 @@ class AccountMap:
                 return None
             return [
                 {"name": name, "id": uid}
-                for name, uid in self._name_to_uuid.items()
+                for uid, name in self._uuid_to_name.items()
             ]
 
     def uuid_to_name(self, uuid: str) -> str:
@@ -121,25 +127,80 @@ class AccountMap:
         with self._lock:
             return self._uuid_to_name.get(uuid, uuid)
 
+    def _load_accounts(self, accounts: list[dict], *, source: str) -> int:
+        """Populate both directions, refusing ambiguous name lookups."""
+        name_to_uuids: dict[str, set[str]] = {}
+        uuid_to_name: dict[str, str] = {}
+        for acct in accounts:
+            name = acct.get("name", "")
+            uid = acct.get("id", "")
+            if name and uid:
+                name_to_uuids.setdefault(name, set()).add(uid)
+                uuid_to_name[uid] = name
+
+        ambiguous = {
+            name for name, uuids in name_to_uuids.items() if len(uuids) > 1
+        }
+        name_to_uuid = {
+            name: next(iter(uuids))
+            for name, uuids in name_to_uuids.items()
+            if name not in ambiguous
+        }
+
+        with self._lock:
+            self._name_to_uuid = name_to_uuid
+            self._uuid_to_name = uuid_to_name
+            self._ambiguous_names = ambiguous
+            self._source = source
+            self._loaded_at = time.monotonic()
+
+        if ambiguous:
+            logger.warning(
+                "AccountMap refused ambiguous display-name lookups for %s "
+                "(map source: %s)",
+                ", ".join(sorted(repr(name) for name in ambiguous)),
+                source,
+            )
+        logger.debug(
+            "AccountMap loaded: %d accounts (source: %s)",
+            len(uuid_to_name),
+            source,
+        )
+        return len(uuid_to_name)
+
     def load_from_jxa(self, accounts: list[dict]) -> None:
-        """Populate the map from listAccounts() output.
+        """Populate from JXA output and persist the validated rows.
 
         Args:
             accounts: List of {"name": "Work", "id": "UUID"} dicts
         """
-        with self._lock:
-            self._name_to_uuid.clear()
-            self._uuid_to_name.clear()
-            for acct in accounts:
-                name = acct.get("name", "")
-                uid = acct.get("id", "")
-                if name and uid:
-                    self._name_to_uuid[name] = uid
-                    self._uuid_to_name[uid] = name
-            self._loaded_at = time.monotonic()
-            logger.debug(
-                "AccountMap loaded: %d accounts", len(self._name_to_uuid)
+        self._load_accounts(accounts, source="jxa")
+        try:
+            from .manager import IndexManager
+
+            IndexManager.get_instance().save_account_map(accounts)
+        except Exception:
+            logger.warning(
+                "Could not persist the JXA account display-name map",
+                exc_info=True,
             )
+
+    def load_from_db(self) -> bool:
+        """Load the persisted map without contacting Mail.app."""
+        try:
+            from .manager import IndexManager
+
+            accounts = IndexManager.get_instance().load_account_map()
+        except Exception:
+            logger.debug(
+                "Could not read the persisted account display-name map",
+                exc_info=True,
+            )
+            return False
+        if not accounts:
+            return False
+        self._load_accounts(accounts, source="db")
+        return True
 
     def _is_stale(self) -> bool:
         """Check if the cache needs refreshing."""
@@ -165,6 +226,9 @@ class AccountMap:
             if not self._is_stale():
                 return
 
+            if self.load_from_db():
+                return
+
             if not allow_jxa:
                 return
 
@@ -181,24 +245,18 @@ def resolve_excluded_account_uuids(
 ) -> set[str]:
     """Resolve excluded account names to UUIDs from a synchronous context.
 
-    The index build, disk sync, watcher, and CLI run without an event
-    loop and are otherwise JXA-free, but the only name↔UUID bridge is
-    JXA (account display names live nowhere on disk). This performs a
-    single synchronous JXA fetch to populate the shared
-    :class:`AccountMap` (skipped when the map is still fresh — e.g.
-    ``sync_updates`` then ``start_watcher`` back-to-back at ``serve``
-    startup), then resolves — but **only when** ``names`` is non-empty,
-    so the common no-exclusions case stays JXA-free and free.
+    The index build, disk sync, watcher, and CLI first use the persisted
+    account map. JXA is only a bootstrap fallback when that table is
+    empty and exclusions actually require name resolution.
 
     ``names=None`` (the default) reads the configured exclusions via
     :func:`~apple_mail_mcp.config.get_index_exclude_accounts`, so the
     index/sync/watcher callers can never diverge on which config key
     feeds the exclusion set.
 
-    Returns an empty set (and logs) if the JXA fetch fails, so a
-    transient Mail.app hiccup degrades to "nothing excluded at the
-    index layer" rather than crashing the build. The server-layer gates
-    remain as a second line of defense.
+    Returns an empty set (and logs) if neither source can resolve the
+    map. Server read paths treat that total failure as fail-closed when
+    exclusions are configured.
     """
     if names is None:
         from ..config import get_index_exclude_accounts
@@ -209,17 +267,21 @@ def resolve_excluded_account_uuids(
 
     acct_map = AccountMap.get_instance()
     if acct_map.get_cached_accounts() is None:  # cold or stale
-        from ..builders import AccountsQueryBuilder
-        from ..executor import execute_with_core
+        if not acct_map.load_from_db():
+            from ..builders import AccountsQueryBuilder
+            from ..executor import execute_with_core
 
-        try:
-            accounts = execute_with_core(AccountsQueryBuilder().list_accounts())
-        except Exception as exc:
-            logger.warning(
-                "Could not resolve excluded accounts via JXA (%s); "
-                "no accounts excluded at the index layer this run.",
-                exc,
-            )
-            return set()
-        acct_map.load_from_jxa(accounts)
+            try:
+                accounts = execute_with_core(
+                    AccountsQueryBuilder().list_accounts()
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not resolve excluded accounts from the "
+                    "persisted map or JXA (%s); no accounts excluded "
+                    "at the index layer this run.",
+                    exc,
+                )
+                return set()
+            acct_map.load_from_jxa(accounts)
     return acct_map.names_to_uuids(names)

@@ -30,6 +30,7 @@ from ..config import (
 )
 from .schema import (
     INSERT_EMAIL_SQL,
+    UPSERT_ACCOUNT_SQL,
     init_database,
     insert_attachments,
     optimize_fts_index,
@@ -170,6 +171,52 @@ class IndexManager:
     def has_index(self) -> bool:
         """Check if an index database exists."""
         return self._db_path.exists()
+
+    def save_account_map(self, accounts: list[dict]) -> int:
+        """Write through a JXA account list without breaking live reads."""
+        try:
+            rows = [
+                (acct.get("id"), acct.get("name"))
+                for acct in accounts
+                if acct.get("id") and acct.get("name")
+            ]
+            if not rows:
+                return 0
+
+            conn = self._get_conn()
+            conn.executemany(UPSERT_ACCOUNT_SQL, rows)
+            conn.commit()
+            return len(rows)
+        except Exception:
+            if self._conn is not None:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+            logger.warning(
+                "Could not persist the account display-name map",
+                exc_info=True,
+            )
+            return 0
+
+    def load_account_map(self) -> list[dict]:
+        """Return persisted account display names and UUIDs."""
+        if not self.has_index():
+            return []
+        try:
+            cursor = self._get_conn().execute(
+                "SELECT uuid, name FROM accounts ORDER BY name, uuid"
+            )
+            return [
+                {"name": row["name"], "id": row["uuid"]}
+                for row in cursor.fetchall()
+            ]
+        except Exception:
+            logger.debug(
+                "Could not load the persisted account display-name map",
+                exc_info=True,
+            )
+            return []
 
     def is_empty(self) -> bool:
         """Check whether an existing index holds no emails.
