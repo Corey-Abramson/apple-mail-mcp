@@ -125,6 +125,9 @@ class AccountMap:
             Friendly name, or the UUID itself as fallback
         """
         with self._lock:
+            # Load-bearing fallback: Mail.app's local "On My Mac" store
+            # has a UUID in the indexes but is not an account and is never
+            # returned by Mail.accounts(). An unresolvable UUID is normal.
             return self._uuid_to_name.get(uuid, uuid)
 
     def _load_accounts(self, accounts: list[dict], *, source: str) -> int:
@@ -229,7 +232,9 @@ class AccountMap:
             if self.load_from_db():
                 return
 
-            if not allow_jxa:
+            from ..config import get_offline_mode
+
+            if not allow_jxa or get_offline_mode():
                 return
 
             from ..builders import AccountsQueryBuilder
@@ -268,6 +273,15 @@ def resolve_excluded_account_uuids(
     acct_map = AccountMap.get_instance()
     if acct_map.get_cached_accounts() is None:  # cold or stale
         if not acct_map.load_from_db():
+            from ..config import get_offline_mode
+
+            if get_offline_mode():
+                raise RuntimeError(
+                    "Account exclusions cannot be enforced offline: "
+                    "the persisted account map is empty. Run "
+                    "'apple-mail-mcp sync-accounts' with Mail.app running "
+                    "or seed it with --map."
+                )
             from ..builders import AccountsQueryBuilder
             from ..executor import execute_with_core
 

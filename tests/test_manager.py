@@ -108,6 +108,62 @@ class TestAccountMapPersistence:
             )
 
 
+class TestOfflineIndexReads:
+    """Index-only account, mailbox, and message helpers."""
+
+    def test_lists_accounts_mailboxes_and_cached_email(self, temp_db_path):
+        manager = IndexManager(db_path=temp_db_path)
+        conn = manager._get_conn()
+        conn.executemany(
+            "INSERT INTO emails (message_id, account, mailbox, subject, "
+            "sender, content, date_received) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    1,
+                    "UUID-A",
+                    "INBOX",
+                    "One",
+                    "a@example.com",
+                    "A",
+                    "2026-01-01",
+                ),
+                (
+                    2,
+                    "UUID-A",
+                    "INBOX",
+                    "Two",
+                    "b@example.com",
+                    "B",
+                    "2026-01-02",
+                ),
+                (
+                    3,
+                    "UUID-B",
+                    "Sent",
+                    "Three",
+                    "c@example.com",
+                    "C",
+                    "2026-01-03",
+                ),
+            ],
+        )
+        conn.commit()
+
+        assert manager.list_index_account_uuids() == ["UUID-A", "UUID-B"]
+        assert manager.list_index_mailboxes("UUID-A") == [
+            {"name": "INBOX", "message_count": 2}
+        ]
+        assert manager.get_indexed_email(2, account="UUID-A") == {
+            "message_id": 2,
+            "account": "UUID-A",
+            "mailbox": "INBOX",
+            "subject": "Two",
+            "sender": "b@example.com",
+            "content": "B",
+            "date_received": "2026-01-02",
+        }
+
+
 class TestGetStats:
     """Tests for index statistics."""
 

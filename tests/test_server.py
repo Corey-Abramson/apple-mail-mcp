@@ -37,8 +37,10 @@ def _isolate_server_singletons(monkeypatch):
     """
     from pathlib import Path
 
+    from apple_mail_mcp.config import set_offline_mode
     from apple_mail_mcp.index.accounts import AccountMap
 
+    set_offline_mode(False)
     AccountMap.get_instance().reset()
     monkeypatch.setattr(
         "apple_mail_mcp.index.disk.find_mail_directory",
@@ -49,6 +51,7 @@ def _isolate_server_singletons(monkeypatch):
         lambda mail_dir: Path("/nonexistent/Envelope Index"),
     )
     yield
+    set_offline_mode(False)
     AccountMap.get_instance().reset()
 
 
@@ -1856,3 +1859,232 @@ class TestSearchIndexHonesty:
                 await search("worldpay")
 
         assert "malformed" in str(excinfo.value)
+
+
+class TestOfflineMode:
+    """Offline tools answer from local indexes and never invoke JXA."""
+
+    @staticmethod
+    def _account_map(accounts=None):
+        account_map = MagicMock()
+        account_map.ensure_loaded = AsyncMock()
+        account_map.get_cached_accounts.return_value = accounts or [
+            {"name": "Work", "id": "UUID-W"}
+        ]
+        account_map.name_to_uuid.side_effect = (
+            lambda name: "UUID-W" if name == "Work" else None
+        )
+        account_map.uuid_to_name.side_effect = (
+            lambda uuid: "Work" if uuid == "UUID-W" else uuid
+        )
+        return account_map
+
+    @pytest.mark.asyncio
+    async def test_list_accounts_includes_raw_local_store_uuid(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("APPLE_MAIL_OFFLINE", "true")
+        manager = MagicMock()
+        manager.has_index.return_value = True
+        manager.list_index_account_uuids.return_value = [
+            "UUID-W",
+            "LOCAL-STORE-UUID",
+        ]
+        account_map = self._account_map()
+
+        with (
+            patch(
+                "apple_mail_mcp.server._get_index_manager",
+                return_value=manager,
+            ),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=account_map,
+            ),
+            patch("apple_mail_mcp.server.execute_with_core_async") as jxa,
+        ):
+            from apple_mail_mcp.server import list_accounts
+
+            result = await list_accounts()
+
+        assert result == [
+            {"name": "Work", "id": "UUID-W"},
+            {"name": "LOCAL-STORE-UUID", "id": "LOCAL-STORE-UUID"},
+        ]
+        jxa.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_mailboxes_falls_back_to_fts_index(self, monkeypatch):
+        monkeypatch.setenv("APPLE_MAIL_OFFLINE", "true")
+        manager = MagicMock()
+        manager.has_index.return_value = True
+        manager.list_index_account_uuids.return_value = ["UUID-W"]
+        manager.list_index_mailboxes.return_value = [
+            {"name": "INBOX", "message_count": 4}
+        ]
+
+        with (
+            patch(
+                "apple_mail_mcp.server._get_index_manager",
+                return_value=manager,
+            ),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=self._account_map(),
+            ),
+            patch("apple_mail_mcp.server.execute_with_core_async") as jxa,
+        ):
+            from apple_mail_mcp.server import list_mailboxes
+
+            result = await list_mailboxes("Work")
+
+        assert result == [{"name": "INBOX", "unreadCount": 0}]
+        jxa.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_emails_uses_envelope_index_only(self, monkeypatch):
+        from apple_mail_mcp.index.envelope_direct import EnvelopeMessageRow
+
+        monkeypatch.setenv("APPLE_MAIL_OFFLINE", "true")
+        manager = MagicMock()
+        manager.has_index.return_value = True
+        manager.list_index_account_uuids.return_value = ["UUID-W"]
+        row = EnvelopeMessageRow(
+            message_id=7,
+            subject="Offline",
+            sender="sender@example.com",
+            date_received="2026-08-29T00:00:00+00:00",
+            mailbox_url="imap://UUID-W/INBOX",
+            account_uuid="UUID-W",
+            mailbox_name="INBOX",
+            read=False,
+            flagged=True,
+        )
+
+        with (
+            patch(
+                "apple_mail_mcp.server._get_index_manager",
+                return_value=manager,
+            ),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=self._account_map(),
+            ),
+            patch(
+                "apple_mail_mcp.index.disk.find_mail_directory",
+                return_value=Path("/mail/V10"),
+            ),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.envelope_index_path",
+                return_value=Path("/mail/V10/MailData/Envelope Index"),
+            ),
+            patch("pathlib.Path.exists", return_value=True),
+            patch(
+                "apple_mail_mcp.index.envelope_direct.fetch_recent_messages",
+                return_value=[row],
+            ),
+            patch("apple_mail_mcp.server.execute_query_async") as jxa,
+        ):
+            from apple_mail_mcp.server import get_emails
+
+            result = await get_emails("Work", "INBOX")
+
+        assert result == [
+            {
+                "id": 7,
+                "subject": "Offline",
+                "sender": "sender@example.com",
+                "date_received": "2026-08-29T00:00:00+00:00",
+                "read": False,
+                "flagged": True,
+            }
+        ]
+        jxa.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_email_uses_cached_index_content(self, monkeypatch):
+        monkeypatch.setenv("APPLE_MAIL_OFFLINE", "true")
+        manager = MagicMock()
+        manager.has_index.return_value = True
+        manager.find_email_path.return_value = None
+        manager.get_indexed_email.return_value = {
+            "message_id": 9,
+            "account": "UUID-W",
+            "mailbox": "INBOX",
+            "subject": "Cached",
+            "sender": "sender@example.com",
+            "content": "Stored body",
+            "date_received": "2026-08-29",
+        }
+        manager.get_email_attachments.return_value = []
+
+        with (
+            patch(
+                "apple_mail_mcp.server._get_index_manager",
+                return_value=manager,
+            ),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=self._account_map(),
+            ),
+            patch("apple_mail_mcp.server.execute_with_core_async") as jxa,
+        ):
+            from apple_mail_mcp.server import get_email
+
+            result = await get_email(9, account="Work")
+
+        assert result["content"] == "Stored body"
+        assert result["date_sent"] == ""
+        jxa.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_search_fails_closed_when_exclusion_map_missing(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("APPLE_MAIL_OFFLINE", "true")
+        monkeypatch.setenv("APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS", "Work")
+        manager = MagicMock()
+        manager.has_index.return_value = True
+        account_map = self._account_map(accounts=[])
+        account_map.get_cached_accounts.return_value = None
+
+        with (
+            patch(
+                "apple_mail_mcp.server._get_index_manager",
+                return_value=manager,
+            ),
+            patch(
+                "apple_mail_mcp.server._get_account_map",
+                return_value=account_map,
+            ),
+            patch("apple_mail_mcp.server.execute_query_async") as jxa,
+        ):
+            from apple_mail_mcp.server import search
+
+            with pytest.raises(RuntimeError, match="cannot be enforced"):
+                await search("sensitive")
+
+        manager.search.assert_not_called()
+        jxa.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_search_without_index_never_falls_back_to_jxa(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("APPLE_MAIL_OFFLINE", "true")
+        manager = MagicMock()
+        manager.has_index.return_value = False
+
+        with (
+            patch(
+                "apple_mail_mcp.server._get_index_manager",
+                return_value=manager,
+            ),
+            patch("apple_mail_mcp.server.execute_query_async") as jxa,
+        ):
+            from apple_mail_mcp.server import search
+
+            with pytest.raises(ValueError, match="Offline search requires"):
+                await search("anything")
+
+        jxa.assert_not_called()

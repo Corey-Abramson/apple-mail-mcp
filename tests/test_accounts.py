@@ -186,6 +186,21 @@ class TestEnsureLoaded:
 
     @pytest.mark.asyncio
     @patch("apple_mail_mcp.executor.execute_with_core_async")
+    async def test_offline_mode_forbids_jxa_even_when_allowed(
+        self, mock_exec, monkeypatch
+    ):
+        """The global offline contract overrides a permissive caller."""
+        monkeypatch.setenv("APPLE_MAIL_OFFLINE", "true")
+        mock_exec.side_effect = AssertionError("JXA must not be called")
+        m = AccountMap()
+
+        await m.ensure_loaded(allow_jxa=True)
+
+        mock_exec.assert_not_called()
+        assert m.get_cached_accounts() is None
+
+    @pytest.mark.asyncio
+    @patch("apple_mail_mcp.executor.execute_with_core_async")
     async def test_uses_persisted_map_before_jxa(self, mock_exec):
         """A persisted map is sufficient even when JXA is allowed."""
         IndexManager.get_instance().save_account_map(SAMPLE_ACCOUNTS)

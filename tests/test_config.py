@@ -20,7 +20,9 @@ from apple_mail_mcp.config import (
     get_index_path,
     get_index_staleness_hours,
     get_lock_retry_seconds,
+    get_offline_mode,
     get_read_only_mode,
+    set_offline_mode,
     set_read_only_mode,
 )
 
@@ -42,8 +44,10 @@ def clear_env(monkeypatch):
         if key.startswith("APPLE_MAIL_"):
             monkeypatch.delenv(key, raising=False)
     set_read_only_mode(False)
+    set_offline_mode(False)
     yield
     set_read_only_mode(False)
+    set_offline_mode(False)
 
 
 def os_environ_keys():
@@ -80,6 +84,9 @@ class TestNoFile:
 
     def test_read_only(self, config_file):
         assert get_read_only_mode() is False
+
+    def test_offline(self, config_file):
+        assert get_offline_mode() is False
 
     def test_lock_retry_seconds(self, config_file):
         assert get_lock_retry_seconds() == 180.0
@@ -204,6 +211,17 @@ read_only = true
         )
         assert get_read_only_mode() is True
 
+    def test_offline(self, config_file):
+        _write(
+            config_file,
+            f"""
+config_version = {CONFIG_SCHEMA_VERSION}
+[server]
+offline = true
+""",
+        )
+        assert get_offline_mode() is True
+
 
 class TestEnvOverridesFile:
     """Env var wins over TOML file value."""
@@ -261,6 +279,18 @@ read_only = true
         monkeypatch.setenv("APPLE_MAIL_READ_ONLY", "false")
         assert get_read_only_mode() is False
 
+    def test_offline_env_overrides_file(self, config_file, monkeypatch):
+        _write(
+            config_file,
+            f"""
+config_version = {CONFIG_SCHEMA_VERSION}
+[server]
+offline = true
+""",
+        )
+        monkeypatch.setenv("APPLE_MAIL_OFFLINE", "false")
+        assert get_offline_mode() is False
+
     def test_lock_retry_seconds_env_overrides_file(
         self, config_file, monkeypatch
     ):
@@ -299,6 +329,21 @@ read_only = false
         monkeypatch.setenv("APPLE_MAIL_READ_ONLY", "false")
         set_read_only_mode(True)
         assert get_read_only_mode() is True
+
+    def test_offline_overrides_env_false_and_file_false(
+        self, config_file, monkeypatch
+    ):
+        _write(
+            config_file,
+            f"""
+config_version = {CONFIG_SCHEMA_VERSION}
+[server]
+offline = false
+""",
+        )
+        monkeypatch.setenv("APPLE_MAIL_OFFLINE", "false")
+        set_offline_mode(True)
+        assert get_offline_mode() is True
 
 
 class TestValidationErrors:

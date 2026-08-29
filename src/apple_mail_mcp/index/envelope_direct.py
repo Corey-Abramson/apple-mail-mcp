@@ -58,6 +58,14 @@ class EnvelopeMessageRow:
     flagged: bool
 
 
+@dataclass(frozen=True)
+class EnvelopeMailboxRow:
+    """One mailbox from the Envelope Index."""
+
+    name: str
+    unread_count: int
+
+
 def _unix_ts_to_iso(ts: int | float | None) -> str:
     """Convert Mail V10's Envelope Index date_received to ISO 8601.
 
@@ -124,6 +132,52 @@ def list_account_uuids(envelope_path: Path) -> list[str]:
             if uuid:
                 uuids.add(uuid)
         return sorted(uuids)
+    finally:
+        conn.close()
+
+
+def list_mailboxes_for_account(
+    envelope_path: Path, account_uuid: str
+) -> list[EnvelopeMailboxRow]:
+    """List one account/local store's mailboxes with unread counts.
+
+    Reads Apple's Envelope Index in read-only mode. Gmail label-backed
+    membership is included when the ``labels`` table is present.
+
+    Raises:
+        sqlite3.OperationalError: On an unavailable or incompatible schema.
+    """
+    conn = sqlite3.connect(f"file:{envelope_path}?mode=ro", uri=True)
+    try:
+        mailboxes = list(
+            conn.execute(
+                "SELECT ROWID, url FROM mailboxes WHERE url LIKE ?",
+                (f"%://{account_uuid}/%",),
+            )
+        )
+        has_labels = _has_labels_table(conn)
+        rows: list[EnvelopeMailboxRow] = []
+        for mailbox_rowid, url in mailboxes:
+            uuid, name = _parse_mailbox_url(url or "")
+            if uuid != account_uuid or not name:
+                continue
+            if has_labels:
+                unread = conn.execute(
+                    "SELECT COUNT(DISTINCT m.ROWID) "
+                    "FROM messages m "
+                    "LEFT JOIN labels l ON l.message_id = m.ROWID "
+                    "WHERE m.deleted = 0 AND m.read = 0 "
+                    "AND (m.mailbox = ? OR l.mailbox_id = ?)",
+                    (mailbox_rowid, mailbox_rowid),
+                ).fetchone()[0]
+            else:
+                unread = conn.execute(
+                    "SELECT COUNT(*) FROM messages "
+                    "WHERE deleted = 0 AND read = 0 AND mailbox = ?",
+                    (mailbox_rowid,),
+                ).fetchone()[0]
+            rows.append(EnvelopeMailboxRow(name=name, unread_count=int(unread)))
+        return sorted(rows, key=lambda row: row.name.casefold())
     finally:
         conn.close()
 

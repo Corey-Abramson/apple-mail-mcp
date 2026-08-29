@@ -48,6 +48,7 @@ from .builders import AccountsQueryBuilder, QueryBuilder
 from .config import (
     get_default_account,
     get_default_mailbox,
+    get_offline_mode,
     get_read_only_mode,
 )
 from .executor import (
@@ -348,17 +349,82 @@ def _excluded_account_names() -> set[str]:
 
 
 async def _excluded_account_uuids() -> set[str]:
-    """Resolve hidden account names to UUIDs via the JXA-backed map.
+    """Resolve hidden account names to UUIDs, failing closed.
 
     Empty (and skips the map load) when nothing is configured, so the
     common case adds no overhead. Used to filter the unscoped read
     paths whose rows are keyed by UUID, not by the requested name.
+
+    In offline mode the persisted map is the sole authority. If any
+    configured name cannot be resolved, returning partial results would
+    risk surfacing mail from a hidden account, so the request fails.
     """
     names = _excluded_account_names()
     if not names:
         return set()
-    await _get_account_map().ensure_loaded()
-    return _get_account_map().names_to_uuids(names)
+    acct_map = _get_account_map()
+    await acct_map.ensure_loaded(allow_jxa=not get_offline_mode())
+    if acct_map.get_cached_accounts() is None:
+        raise RuntimeError(
+            "Account exclusions cannot be enforced: the persisted "
+            "account map is empty and offline mode forbids Mail.app "
+            "lookups. Run 'apple-mail-mcp sync-accounts' with "
+            "Mail.app running or seed it with --map."
+        )
+    resolved = acct_map.names_to_uuids(names)
+    unresolved = {name for name in names if acct_map.name_to_uuid(name) is None}
+    if unresolved:
+        raise RuntimeError(
+            "Account exclusions cannot be enforced because these exact "
+            "account names are unresolved or ambiguous: "
+            + ", ".join(sorted(repr(name) for name in unresolved))
+        )
+    return resolved
+
+
+async def _offline_accounts() -> list[Account]:
+    """List persisted accounts plus raw index-only store UUIDs.
+
+    Mail.app's local ``On My Mac`` store is represented in the indexes
+    by a UUID but is never returned by ``Mail.accounts()``. Its raw UUID
+    is therefore a normal offline listing entry, not a mapping failure.
+    """
+    manager = _get_index_manager()
+    if not manager.has_index():
+        raise RuntimeError(
+            "Offline account listing requires the search index. Run "
+            "'apple-mail-mcp index' before starting offline mode."
+        )
+    acct_map = _get_account_map()
+    await acct_map.ensure_loaded(allow_jxa=False)
+    persisted = acct_map.get_cached_accounts() or []
+    by_uuid = {account["id"]: account for account in persisted}
+    for uuid in manager.list_index_account_uuids():
+        by_uuid.setdefault(
+            uuid,
+            {"name": acct_map.uuid_to_name(uuid), "id": uuid},
+        )
+
+    excluded_names = _excluded_account_names()
+    excluded_uuids = await _excluded_account_uuids()
+    return [
+        Account(name=account["name"], id=account["id"])
+        for account in by_uuid.values()
+        if account["name"] not in excluded_names
+        and account["id"] not in excluded_uuids
+    ]
+
+
+async def _offline_account_uuid(account: str | None) -> str | None:
+    """Resolve a display name or raw UUID using only indexed state."""
+    requested = _resolve_account(account)
+    accounts = await _offline_accounts()
+    if requested is None:
+        return accounts[0]["id"] if accounts else None
+    for candidate in accounts:
+        if requested in (candidate["name"], candidate["id"]):
+            return candidate["id"]
+    return None
 
 
 def _hidden_account(account: str | None) -> bool:
@@ -423,6 +489,11 @@ async def list_accounts() -> list[Account]:
     """
     List all configured email accounts in Apple Mail.
 
+    In offline mode this merges the persisted JXA account map with
+    account/store UUIDs found in the index. The result can therefore
+    exceed Mail.app's live account count when a local ``On My Mac``
+    store is indexed; that store is surfaced by its raw UUID.
+
     Returns:
         List of account dictionaries with 'name' and 'id' fields.
 
@@ -430,6 +501,9 @@ async def list_accounts() -> list[Account]:
         >>> list_accounts()
         [{"name": "Work", "id": "abc123"}, {"name": "Personal", "id": "def456"}]
     """
+    if get_offline_mode():
+        return await _offline_accounts()
+
     # Strategy 0: serve from the AccountMap cache when it's warm.
     # The cache is hydrated by any prior list_accounts() call (5-min
     # TTL) — so within a single MCP session this skips the ~150ms
@@ -469,6 +543,43 @@ async def list_mailboxes(account: str | None = None) -> list[Mailbox]:
     if _hidden_account(account):
         # Hidden account: do not list its mailboxes, do not fall to JXA.
         return []
+    if get_offline_mode():
+        account_uuid = await _offline_account_uuid(account)
+        if account_uuid is None:
+            raise ValueError(f"Account {account!r} not found in index.")
+
+        try:
+            from .index.disk import find_mail_directory
+            from .index.envelope_direct import (
+                envelope_index_path,
+                list_mailboxes_for_account,
+            )
+
+            env_path = envelope_index_path(find_mail_directory())
+            rows = await asyncio.to_thread(
+                list_mailboxes_for_account, env_path, account_uuid
+            )
+            if rows:
+                return [
+                    Mailbox(name=row.name, unreadCount=row.unread_count)
+                    for row in rows
+                ]
+        except (
+            FileNotFoundError,
+            PermissionError,
+            sqlite3.OperationalError,
+        ) as exc:
+            logger.debug(
+                "Envelope Index mailbox listing unavailable offline (%s); "
+                "using the FTS index without unread counts",
+                exc,
+            )
+
+        indexed_rows = _get_index_manager().list_index_mailboxes(account_uuid)
+        return [
+            Mailbox(name=row["name"], unreadCount=0) for row in indexed_rows
+        ]
+
     # Resolve None/excluded-default to a visible account so JXA never
     # implicitly lists a hidden account's mailboxes.
     resolved = await _resolve_visible_account(account)
@@ -520,9 +631,19 @@ async def get_emails(
         # Hidden account explicitly requested: return nothing and do
         # NOT fall through to JXA (which would surface its mail).
         return []
+    offline = get_offline_mode()
+    offline_account_uuid: str | None = None
+    if offline:
+        offline_account_uuid = await _offline_account_uuid(account)
+        if offline_account_uuid is None:
+            raise ValueError(f"Account {account!r} not found in index.")
     # Resolve None/excluded-default to a visible account so neither the
     # fast path nor the JXA fallback implicitly targets a hidden one.
-    target_account = await _resolve_visible_account(account)
+    target_account = (
+        _get_account_map().uuid_to_name(offline_account_uuid)
+        if offline_account_uuid
+        else await _resolve_visible_account(account)
+    )
     if target_account is None and _excluded_account_names():
         # No visible account at all (every account is hidden): the JXA
         # fallback would target Mail.accounts()[0] — a hidden one.
@@ -550,13 +671,13 @@ async def get_emails(
             # Resolve display-name -> UUID via the cache. Hydrates
             # the cache via JXA on first hit; subsequent calls are
             # in-process.
-            await _get_account_map().ensure_loaded()
+            await _get_account_map().ensure_loaded(allow_jxa=not offline)
             excluded_names = _excluded_account_names()
-            excluded_uuids = _get_account_map().names_to_uuids(excluded_names)
-            account_uuid: str | None = None
-            if target_account:
+            excluded_uuids = await _excluded_account_uuids()
+            account_uuid: str | None = offline_account_uuid
+            if account_uuid is None and target_account:
                 account_uuid = _get_account_map().name_to_uuid(target_account)
-            else:
+            elif account_uuid is None:
                 # No account requested: scope to the first account,
                 # matching the documented behavior and the JXA path
                 # (which would otherwise see a different result set).
@@ -600,12 +721,24 @@ async def get_emails(
                 ]
     except (
         FileNotFoundError,
+        PermissionError,
         sqlite3.OperationalError,
         MailboxNotFoundError,
     ) as exc:
+        if offline:
+            raise RuntimeError(
+                "Offline email listing could not read Apple's Envelope "
+                f"Index: {exc}. Mail.app fallback is disabled."
+            ) from exc
         logger.debug(
             "Envelope Index fast path unavailable (%s); falling back to JXA",
             exc,
+        )
+
+    if offline:
+        raise RuntimeError(
+            "Offline email listing could not use Apple's Envelope Index. "
+            "Mail.app fallback is disabled."
         )
 
     # Strategy 1: JXA batchFetch fallback. Preserves correctness
@@ -747,6 +880,8 @@ async def get_email(
         # account is indistinguishable from a missing message, and do
         # not fall through to any strategy that would fetch it live.
         raise ValueError(f"Email {message_id} not found.")
+    offline = get_offline_mode()
+    excluded_uuids = await _excluded_account_uuids()
     # Resolve None/excluded-default to a visible account so the JXA
     # strategies never implicitly scan a hidden default account.
     resolved_account = await _resolve_visible_account(account)
@@ -782,14 +917,15 @@ async def get_email(
 
             acct_map = _get_account_map()
             await acct_map.ensure_loaded(
-                allow_jxa=account is not None or bool(_excluded_account_names())
+                allow_jxa=(
+                    not offline
+                    and (account is not None or bool(_excluded_account_names()))
+                )
             )
 
             idx_acct = None
             if account is not None:
                 idx_acct = acct_map.name_to_uuid(account) or account
-
-            excluded_uuids = acct_map.names_to_uuids(_excluded_account_names())
 
             emlx_path = manager.find_email_path(
                 message_id, account=idx_acct, mailbox=mailbox
@@ -837,6 +973,42 @@ async def get_email(
             message_id,
             exc_info=True,
         )
+
+    # Offline Strategy 1: return the content persisted in the FTS index.
+    # The index does not retain live read/flagged state or every MIME
+    # header, so those fields use their documented neutral defaults.
+    if offline:
+        manager = _get_index_manager()
+        acct_map = _get_account_map()
+        await acct_map.ensure_loaded(allow_jxa=False)
+        idx_acct = None
+        if account is not None:
+            idx_acct = acct_map.name_to_uuid(account) or account
+        indexed = manager.get_indexed_email(
+            message_id, account=idx_acct, mailbox=mailbox
+        )
+        if indexed is None or indexed["account"] in excluded_uuids:
+            raise ValueError(f"Email {message_id} not found.")
+        return {
+            "id": indexed["message_id"],
+            "subject": indexed["subject"],
+            "sender": indexed["sender"],
+            "content": indexed["content"],
+            "date_received": indexed["date_received"],
+            "date_sent": "",
+            "read": False,
+            "flagged": False,
+            "reply_to": "",
+            "message_id": "",
+            "attachments": (
+                manager.get_email_attachments(
+                    message_id,
+                    account=indexed["account"],
+                    mailbox=indexed["mailbox"],
+                )
+                or []
+            ),
+        }
 
     # Stale-entry handling: clean up the dead row and fail fast with a
     # clear message. Skipping Strategies 1-3 here is intentional — they
@@ -1008,7 +1180,12 @@ async def _resolve_emlx_path(
     idx_acct = None
     if account:
         acct_map = _get_account_map()
-        await acct_map.ensure_loaded()
+        await acct_map.ensure_loaded(
+            allow_jxa=(
+                not get_offline_mode()
+                and (bool(account) or bool(_excluded_account_names()))
+            )
+        )
         idx_acct = acct_map.name_to_uuid(account) or account
 
     emlx_path = manager.find_email_path(
@@ -1282,12 +1459,15 @@ async def search(
 
         acct_map = _get_account_map()
         await acct_map.ensure_loaded(
-            allow_jxa=bool(account) or bool(_excluded_account_names())
+            allow_jxa=(
+                not get_offline_mode()
+                and (bool(account) or bool(_excluded_account_names()))
+            )
         )
         search_acct = (
             acct_map.name_to_uuid(account) or account if account else None
         )
-        excluded_uuids = acct_map.names_to_uuids(_excluded_account_names())
+        excluded_uuids = await _excluded_account_uuids()
 
         rows = manager.search_attachments(
             query,
@@ -1332,7 +1512,10 @@ async def search(
             # degrades to the raw UUID, so an unfiltered search must never
             # require Mail.app.
             await acct_map.ensure_loaded(
-                allow_jxa=bool(fts_account) or bool(_excluded_account_names())
+                allow_jxa=(
+                    not get_offline_mode()
+                    and (bool(fts_account) or bool(_excluded_account_names()))
+                )
             )
 
             search_account = None
@@ -1342,7 +1525,7 @@ async def search(
                     or fts_account  # fallback: maybe already UUID
                 )
 
-            excluded_uuids = acct_map.names_to_uuids(_excluded_account_names())
+            excluded_uuids = await _excluded_account_uuids()
 
             # Map scope to FTS5 column filter
             fts_column = None
@@ -1397,6 +1580,12 @@ async def search(
     # Date filtering and highlight require the FTS5 index
     if before or after:
         raise ValueError(_NO_INDEX_DATE_MESSAGE)
+
+    if get_offline_mode():
+        raise ValueError(
+            "Offline search requires the FTS index; Mail.app fallback "
+            "is disabled. Run 'apple-mail-mcp index' first."
+        )
 
     # JXA: resolve to a concrete, non-excluded target (never let a
     # None/excluded default implicitly scan a hidden account). Delay this

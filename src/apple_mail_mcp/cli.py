@@ -187,17 +187,24 @@ def _acquire_cli_index_lock(manager: "IndexManager") -> "IndexLock":
     sys.exit(1)
 
 
-def _run_serve(watch: bool = False, read_only: bool = False) -> None:
+def _run_serve(
+    watch: bool = False,
+    read_only: bool = False,
+    offline: bool = False,
+) -> None:
     """Internal function to run the MCP server."""
     import threading
 
-    from .config import set_read_only_mode
+    from .config import set_offline_mode, set_read_only_mode
     from .index import IndexManager
     from .server import mcp
 
     if read_only:
         set_read_only_mode(True)
         print("Read-only mode enabled", file=sys.stderr)
+    if offline:
+        set_offline_mode(True)
+        print("Offline mode enabled (Mail.app/JXA disabled)", file=sys.stderr)
 
     manager = IndexManager.get_instance()
 
@@ -346,6 +353,13 @@ def serve(
             help="Disable write operations (v0.3.0+)",
         ),
     ] = False,
+    offline: Annotated[
+        bool,
+        cyclopts.Parameter(
+            name="--offline",
+            help="Disable all Mail.app/JXA calls",
+        ),
+    ] = False,
 ) -> None:
     """
     Run the MCP server.
@@ -357,7 +371,7 @@ def serve(
     Use --watch to enable real-time index updates when emails arrive.
     Requires Full Disk Access for the terminal.
     """
-    _run_serve(watch=watch, read_only=read_only)
+    _run_serve(watch=watch, read_only=read_only, offline=offline)
 
 
 @app.command
@@ -639,9 +653,16 @@ def default_handler(
             help="Disable write operations (v0.3.0+)",
         ),
     ] = False,
+    offline: Annotated[
+        bool,
+        cyclopts.Parameter(
+            name="--offline",
+            help="Disable all Mail.app/JXA calls",
+        ),
+    ] = False,
 ) -> None:
     """Run the MCP server (default when no command specified)."""
-    _run_serve(watch=watch, read_only=read_only)
+    _run_serve(watch=watch, read_only=read_only, offline=offline)
 
 
 @app.command(name="init")

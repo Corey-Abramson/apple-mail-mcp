@@ -218,6 +218,59 @@ class IndexManager:
             )
             return []
 
+    def list_index_account_uuids(self) -> list[str]:
+        """Return every distinct account/local-store UUID in the index."""
+        if not self.has_index():
+            return []
+        cursor = self._get_conn().execute(
+            "SELECT DISTINCT account FROM emails ORDER BY account"
+        )
+        return [row["account"] for row in cursor.fetchall()]
+
+    def list_index_mailboxes(self, account: str) -> list[dict]:
+        """Return indexed mailbox names and row counts for one UUID."""
+        if not self.has_index():
+            return []
+        cursor = self._get_conn().execute(
+            "SELECT mailbox, COUNT(*) AS message_count "
+            "FROM emails WHERE account = ? "
+            "GROUP BY mailbox ORDER BY mailbox",
+            (account,),
+        )
+        return [
+            {
+                "name": row["mailbox"],
+                "message_count": row["message_count"],
+            }
+            for row in cursor.fetchall()
+        ]
+
+    def get_indexed_email(
+        self,
+        message_id: int,
+        account: str | None = None,
+        mailbox: str | None = None,
+    ) -> dict | None:
+        """Return one email's cached content for an offline read."""
+        if not self.has_index():
+            return None
+        where = ["message_id = ?"]
+        params: list = [message_id]
+        if account:
+            where.append("account = ?")
+            params.append(account)
+        if mailbox:
+            where.append("mailbox = ?")
+            params.append(mailbox)
+        sql = (
+            "SELECT message_id, account, mailbox, subject, sender, "
+            "content, date_received FROM emails WHERE "
+            + " AND ".join(where)
+            + " ORDER BY date_received DESC, rowid DESC LIMIT 1"
+        )
+        row = self._get_conn().execute(sql, params).fetchone()
+        return dict(row) if row else None
+
     def is_empty(self) -> bool:
         """Check whether an existing index holds no emails.
 

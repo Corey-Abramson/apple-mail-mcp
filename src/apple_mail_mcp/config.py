@@ -35,6 +35,7 @@ CONFIG_SCHEMA: dict[str, dict[str, tuple[type, ...]]] = {
     },
     "server": {
         "read_only": (bool,),
+        "offline": (bool,),
         "lock_retry_seconds": (int, float),
     },
 }
@@ -315,6 +316,7 @@ def get_index_staleness_hours() -> float:
 # ========== Server Mode ==========
 
 _read_only_mode: bool = False
+_offline_mode: bool = False
 
 
 def get_read_only_mode() -> bool:
@@ -340,6 +342,30 @@ def set_read_only_mode(value: bool) -> None:
     """Enable or disable read-only mode programmatically."""
     global _read_only_mode
     _read_only_mode = value
+
+
+def get_offline_mode() -> bool:
+    """Check whether every Mail.app/JXA path is disabled.
+
+    Resolution: programmatic flag (set via :func:`set_offline_mode`, e.g.
+    by ``apple-mail-mcp serve --offline``), then ``APPLE_MAIL_OFFLINE``
+    env, then ``[server] offline`` in ``config.toml``, then ``False``.
+    """
+    if _offline_mode:
+        return True
+    env = os.environ.get("APPLE_MAIL_OFFLINE")
+    if env is not None:
+        return env.lower() in ("1", "true", "yes")
+    val = _from_toml("server", "offline")
+    if val is not None:
+        return bool(val)
+    return False
+
+
+def set_offline_mode(value: bool) -> None:
+    """Enable or disable offline mode programmatically."""
+    global _offline_mode
+    _offline_mode = value
 
 
 def get_lock_retry_seconds() -> float:
@@ -426,6 +452,12 @@ config_version = 1
 # Env: APPLE_MAIL_READ_ONLY
 # CLI: apple-mail-mcp serve -r
 # read_only = false
+
+# Disable every Mail.app/JXA call. Reads use the FTS5 index and
+# Apple's local Envelope Index, or fail explicitly when neither can answer.
+# Env: APPLE_MAIL_OFFLINE
+# CLI: apple-mail-mcp serve --offline
+# offline = false
 
 # How often (seconds) an index-passive server instance retries the
 # index writer lock. Only one instance syncs/watches the index at a

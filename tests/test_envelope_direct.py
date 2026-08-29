@@ -15,6 +15,7 @@ from apple_mail_mcp.index.envelope_direct import (
     envelope_index_path,
     fetch_recent_messages,
     list_account_uuids,
+    list_mailboxes_for_account,
 )
 
 # ─── Pure helpers ────────────────────────────────────────────
@@ -146,6 +147,21 @@ class TestListAccountUuids:
         sqlite3.connect(empty).close()
         with pytest.raises(sqlite3.OperationalError):
             list_account_uuids(empty)
+
+
+class TestListMailboxesForAccount:
+    def test_returns_mailboxes_with_unread_counts(self, fake_envelope):
+        rows = list_mailboxes_for_account(fake_envelope, "ACCOUNT-A")
+
+        assert [(row.name, row.unread_count) for row in rows] == [
+            ("Inbox", 2),
+            ("Sent", 0),
+        ]
+
+    def test_scopes_to_requested_account(self, fake_envelope):
+        rows = list_mailboxes_for_account(fake_envelope, "ACCOUNT-B")
+
+        assert [(row.name, row.unread_count) for row in rows] == [("Inbox", 0)]
 
 
 class TestFetchRecentMessages:

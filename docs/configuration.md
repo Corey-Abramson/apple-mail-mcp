@@ -39,6 +39,7 @@ config_version = 1
 
 [server]
 # read_only = false             # Disable write operations
+# offline = false               # Disable every Mail.app/JXA call
 # lock_retry_seconds = 180      # Index-passive lock retry interval
 ```
 
@@ -80,6 +81,7 @@ in CI or in MCP client launch configs.
 | `APPLE_MAIL_INDEX_EXCLUDE_MAILBOXES` | `Drafts` | Comma-separated mailboxes to skip in search |
 | `APPLE_MAIL_INDEX_EXCLUDE_ACCOUNTS` | _unset_ | Comma-separated account names (exact, case-sensitive) hidden from the entire server: never indexed, filtered from search, invisible to the list/get tools |
 | `APPLE_MAIL_READ_ONLY` | `false` | When `true`, disables any write operations |
+| `APPLE_MAIL_OFFLINE` | `false` | When `true`, answers only from the FTS/Envelope indexes and never calls Mail.app/JXA |
 | `APPLE_MAIL_LOCK_RETRY_SECONDS` | `180` | How often an index-passive server instance retries the index writer lock (minimum 1) |
 
 ## Precedence
@@ -129,6 +131,22 @@ Or via environment variable:
 export APPLE_MAIL_READ_ONLY=true
 apple-mail-mcp serve
 ```
+
+## Offline mode
+
+Use `--offline` when the server must never call Mail.app/JXA. Indexed search,
+indexed single-message reads, links, and attachments continue to work. Account
+and mailbox listings use persisted index state; Mail.app's local `On My Mac`
+store appears by its raw UUID because it has no account display name. Operations
+that require Apple's protected Envelope Index fail explicitly when the launching
+process lacks Full Disk Access rather than falling back to Mail.app.
+
+```bash
+apple-mail-mcp serve --read-only --offline
+```
+
+The equivalent durable settings are `APPLE_MAIL_OFFLINE=true` or
+`[server] offline = true` in `config.toml`.
 
 ## Single index writer
 
