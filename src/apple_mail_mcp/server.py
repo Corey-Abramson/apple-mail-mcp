@@ -781,11 +781,13 @@ async def get_email(
             from .index.disk import parse_emlx
 
             acct_map = _get_account_map()
-            await acct_map.ensure_loaded()
+            await acct_map.ensure_loaded(
+                allow_jxa=account is not None or bool(_excluded_account_names())
+            )
 
             idx_acct = None
             if account is not None:
-                idx_acct = acct_map.name_to_uuid(account)
+                idx_acct = acct_map.name_to_uuid(account) or account
 
             excluded_uuids = acct_map.names_to_uuids(_excluded_account_names())
 
@@ -1279,7 +1281,9 @@ async def search(
             )
 
         acct_map = _get_account_map()
-        await acct_map.ensure_loaded()
+        await acct_map.ensure_loaded(
+            allow_jxa=bool(account) or bool(_excluded_account_names())
+        )
         search_acct = (
             acct_map.name_to_uuid(account) or account if account else None
         )
@@ -1317,17 +1321,19 @@ async def search(
     # FTS5: None = search all accounts/mailboxes
     fts_account = account
     fts_mailbox = mailbox
-    # JXA: resolve to a concrete, non-excluded target (never let a
-    # None/excluded default implicitly scan a hidden account).
-    jxa_account = await _resolve_visible_account(account)
-    jxa_mailbox = _resolve_mailbox(mailbox)
 
     # Try FTS5 index for all searchable scopes
     if scope in ("all", "body", "subject", "sender"):
         if indexed:
             # Translate friendly name → UUID for index lookup
             acct_map = _get_account_map()
-            await acct_map.ensure_loaded()
+            # Only the caller-supplied account filter and the exclusion set
+            # need name -> UUID translation. Rendering (uuid_to_name)
+            # degrades to the raw UUID, so an unfiltered search must never
+            # require Mail.app.
+            await acct_map.ensure_loaded(
+                allow_jxa=bool(fts_account) or bool(_excluded_account_names())
+            )
 
             search_account = None
             if fts_account:
@@ -1391,6 +1397,12 @@ async def search(
     # Date filtering and highlight require the FTS5 index
     if before or after:
         raise ValueError(_NO_INDEX_DATE_MESSAGE)
+
+    # JXA: resolve to a concrete, non-excluded target (never let a
+    # None/excluded default implicitly scan a hidden account). Delay this
+    # work until the index paths above have declined the query.
+    jxa_account = await _resolve_visible_account(account)
+    jxa_mailbox = _resolve_mailbox(mailbox)
 
     # JXA-based search for subject/sender or when no index
     if _excluded_account_names() and (

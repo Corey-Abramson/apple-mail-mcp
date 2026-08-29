@@ -41,6 +41,10 @@ def _isolate_server_singletons(monkeypatch):
 
     AccountMap.get_instance().reset()
     monkeypatch.setattr(
+        "apple_mail_mcp.index.disk.find_mail_directory",
+        lambda: Path("/nonexistent/Mail"),
+    )
+    monkeypatch.setattr(
         "apple_mail_mcp.index.envelope_direct.envelope_index_path",
         lambda mail_dir: Path("/nonexistent/Envelope Index"),
     )
@@ -343,6 +347,7 @@ class TestGetEmail:
         assert result["message_id"] == "<abc@example.com>"
         # JXA should NOT have been called
         mock_exec.assert_not_called()
+        acct_map.ensure_loaded.assert_awaited_once_with(allow_jxa=False)
 
     @pytest.mark.asyncio
     @patch("apple_mail_mcp.server._get_account_map")
@@ -522,6 +527,9 @@ class TestSearch:
             # S1: matched_in is now detected dynamically
             assert "body" in result[0]["matched_in"]
             mock_manager.search.assert_called_once()
+            mock_acct_map.ensure_loaded.assert_awaited_once_with(
+                allow_jxa=False
+            )
 
     @pytest.mark.asyncio
     async def test_fts_translates_account_name_to_uuid(self):
@@ -548,6 +556,7 @@ class TestSearch:
             # Verify manager.search received the UUID, not "Work"
             call_kwargs = mock_manager.search.call_args[1]
             assert call_kwargs["account"] == "UUID-WORK-123"
+            mock_acct_map.ensure_loaded.assert_awaited_once_with(allow_jxa=True)
 
     @pytest.mark.asyncio
     async def test_fts_results_show_friendly_account_name(self):
@@ -1042,6 +1051,9 @@ class TestSearchAttachments:
             assert len(results) == 1
             assert results[0]["matched_in"] == "attachment: invoice.pdf"
             assert results[0]["account"] == "Work"
+            mock_acct_map.ensure_loaded.assert_awaited_once_with(
+                allow_jxa=False
+            )
 
 
 class TestGetEmailEnrichesAttachments:

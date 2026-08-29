@@ -147,7 +147,7 @@ class AccountMap:
             return True
         return (time.monotonic() - self._loaded_at) > _CACHE_TTL
 
-    async def ensure_loaded(self) -> None:
+    async def ensure_loaded(self, *, allow_jxa: bool = True) -> None:
         """Ensure the map is populated, fetching via JXA if needed.
 
         Called from async context (MCP tool handlers). Uses
@@ -163,6 +163,9 @@ class AccountMap:
             # Re-check after acquiring lock — another coroutine
             # may have refreshed while we were waiting.
             if not self._is_stale():
+                return
+
+            if not allow_jxa:
                 return
 
             from ..builders import AccountsQueryBuilder

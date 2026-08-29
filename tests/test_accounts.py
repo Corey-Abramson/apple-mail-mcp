@@ -135,3 +135,15 @@ class TestEnsureLoaded:
         await m.ensure_loaded()
 
         mock_exec.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("apple_mail_mcp.executor.execute_with_core_async")
+    async def test_disallows_jxa_when_cold(self, mock_exec):
+        """allow_jxa=False leaves a cold map empty without touching JXA."""
+        mock_exec.side_effect = AssertionError("JXA must not be called")
+        m = AccountMap()
+
+        await m.ensure_loaded(allow_jxa=False)
+
+        mock_exec.assert_not_called()
+        assert m.get_cached_accounts() is None
