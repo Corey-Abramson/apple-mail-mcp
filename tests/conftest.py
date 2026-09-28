@@ -32,6 +32,18 @@ def isolate_default_index(monkeypatch, tmp_path: Path):
     IndexManager._instance = None
 
 
+@pytest.fixture(autouse=True)
+def isolate_mail_directory(monkeypatch):
+    """Keep persisted-account-map tests off the host's ~/Library/Mail.
+
+    Returning None is the "cannot validate" path, so a persisted map
+    loads as it always has; validation tests restore the real helper.
+    """
+    monkeypatch.setattr(
+        "apple_mail_mcp.index.accounts._on_disk_account_uuids", lambda: None
+    )
+
+
 @pytest.fixture
 def temp_db():
     """Create an in-memory database with the schema and standard PRAGMAs."""

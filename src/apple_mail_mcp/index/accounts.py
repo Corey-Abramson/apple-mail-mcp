@@ -23,6 +23,28 @@ logger = logging.getLogger(__name__)
 # Cache TTL in seconds (5 minutes)
 _CACHE_TTL = 300
 
+# Log an unreadable Mail dir once per process, not on every reload.
+_unvalidated_logged = False
+
+
+def _on_disk_account_uuids() -> set[str] | None:
+    """Return the account UUID folder names under the Mail data dir.
+
+    None means the directory could not be read (no Full Disk Access,
+    or Mail never set up), so a caller cannot validate against it.
+    """
+    global _unvalidated_logged
+    from .disk import find_mail_directory
+
+    try:
+        mail_dir = find_mail_directory()
+        return {p.name for p in mail_dir.iterdir() if p.is_dir()}
+    except (FileNotFoundError, PermissionError) as exc:
+        if not _unvalidated_logged:
+            _unvalidated_logged = True
+            logger.warning("Account map not validated against disk: %s", exc)
+        return None
+
 
 class AccountMap:
     """Thread-safe, cached mapping between account names and UUIDs.
@@ -202,6 +224,21 @@ class AccountMap:
             return False
         if not accounts:
             return False
+        # A map persisted on another Mac (migration, restored index)
+        # names UUIDs that do not exist here; trusting it would send
+        # every name lookup to a dead account and skip JXA for good.
+        on_disk = _on_disk_account_uuids()
+        if on_disk is not None:
+            kept = [a for a in accounts if a.get("id") in on_disk]
+            if len(kept) < len(accounts):
+                logger.warning(
+                    "Ignoring %d persisted account(s) with no folder under "
+                    "the Mail directory",
+                    len(accounts) - len(kept),
+                )
+            if not kept:
+                return False
+            accounts = kept
         self._load_accounts(accounts, source="db")
         return True
 

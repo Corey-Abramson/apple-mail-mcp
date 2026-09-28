@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from apple_mail_mcp.index import accounts as _accounts
 from apple_mail_mcp.index.accounts import _CACHE_TTL, AccountMap
 from apple_mail_mcp.index.manager import IndexManager
 
@@ -13,6 +14,11 @@ SAMPLE_ACCOUNTS = [
     {"name": "Work", "id": "24E569DF-5E45-4B6A-8E3C-1A2B3C4D5E6F"},
     {"name": "Personal", "id": "F6E5D4C3-B2A1-4321-9876-FEDCBA098765"},
 ]
+
+
+# Captured before the conftest fixture swaps it out, so the
+# validation tests can put the real helper back.
+_REAL_ON_DISK_ACCOUNT_UUIDS = getattr(_accounts, "_on_disk_account_uuids", None)
 
 
 @pytest.fixture(autouse=True)
@@ -99,6 +105,57 @@ class TestLoadFromJxa:
 
 class TestLoadFromDb:
     """Tests for the persisted, Mail.app-independent map."""
+
+    @pytest.fixture
+    def mail_dir(self, tmp_path, monkeypatch):
+        """A fake ~/Library/Mail/V10 the map is validated against."""
+        mail = tmp_path / "Mail" / "V10"
+        mail.mkdir(parents=True)
+        monkeypatch.setattr(
+            "apple_mail_mcp.index.accounts._on_disk_account_uuids",
+            _REAL_ON_DISK_ACCOUNT_UUIDS,
+        )
+        monkeypatch.setattr(
+            "apple_mail_mcp.index.disk.find_mail_directory", lambda: mail
+        )
+        return mail
+
+    def test_map_with_no_uuid_on_disk_is_rejected(self, mail_dir):
+        """A map carried from another Mac names dead accounts."""
+        (mail_dir / "01A0AC44-0000-0000-0000-000000000000").mkdir()
+        IndexManager.get_instance().save_account_map(SAMPLE_ACCOUNTS)
+        m = AccountMap()
+
+        assert m.load_from_db() is False
+        assert m.name_to_uuid("Work") is None
+
+    def test_map_keeps_only_uuids_on_disk(self, mail_dir):
+        (mail_dir / SAMPLE_ACCOUNTS[0]["id"]).mkdir()
+        IndexManager.get_instance().save_account_map(SAMPLE_ACCOUNTS)
+        m = AccountMap()
+
+        assert m.load_from_db() is True
+        assert m.name_to_uuid("Work") == SAMPLE_ACCOUNTS[0]["id"]
+        assert m.name_to_uuid("Personal") is None
+
+    def test_unreadable_mail_dir_keeps_map_unvalidated(self, monkeypatch):
+        """No Full Disk Access: the persisted map is all there is."""
+        monkeypatch.setattr(
+            "apple_mail_mcp.index.accounts._on_disk_account_uuids",
+            _REAL_ON_DISK_ACCOUNT_UUIDS,
+        )
+
+        def denied():
+            raise PermissionError("no Full Disk Access")
+
+        monkeypatch.setattr(
+            "apple_mail_mcp.index.disk.find_mail_directory", denied
+        )
+        IndexManager.get_instance().save_account_map(SAMPLE_ACCOUNTS)
+        m = AccountMap()
+
+        assert m.load_from_db() is True
+        assert m.name_to_uuid("Personal") == SAMPLE_ACCOUNTS[1]["id"]
 
     def test_round_trip_loads_without_jxa(self):
         manager = IndexManager.get_instance()
