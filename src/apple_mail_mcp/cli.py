@@ -232,6 +232,22 @@ def _run_serve(
 
     if manager.has_index():
 
+        def _release_blocked_writer() -> None:
+            index_lock.release()
+            manager.index_writer = False
+            interval = get_lock_retry_seconds()
+            print(
+                "Releasing the index writer lock — this process cannot "
+                f"read the Mail store (retrying every {interval:.0f}s)",
+                file=sys.stderr,
+                flush=True,
+            )
+            threading.Thread(
+                target=_index_writer_retry_loop,
+                args=(index_lock, manager, _background_sync, interval),
+                daemon=True,
+            ).start()
+
         def _background_sync() -> None:
             try:
                 start = time.time()
@@ -242,6 +258,14 @@ def _run_serve(
                     # "up to date" here is how a once-good index goes
                     # quietly stale for months (#110).
                     _warn_sync_blocked(manager.last_sync_blocked)
+                    if manager.last_sync_blocked == "permission":
+                        # This process cannot read ~/Library/Mail, so
+                        # holding the writer lock only freezes the
+                        # index for a sibling that can (Claude Desktop
+                        # spawns copies without Full Disk Access).
+                        # Step down; the retry loop re-promotes it.
+                        _release_blocked_writer()
+                        return
                 elif count > 0:
                     print(
                         f"Background sync: {count} changes "

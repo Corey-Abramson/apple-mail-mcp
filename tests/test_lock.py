@@ -126,3 +126,86 @@ class TestIndexWriterRetryLoop:
         thread.join(timeout=2.0)
         assert manager.index_writer is True
         assert loser.locked is True
+
+
+class TestBlockedWriterReleasesLock:
+    """A writer that cannot read the Mail store must not keep the lock.
+
+    Claude Desktop spawns copies that may lack Full Disk Access. If
+    one wins the writer lock and holds it for its lifetime, every copy
+    that *can* read Mail stays index-passive and the index freezes.
+    """
+
+    def _serve(self, db_path, blocked, probe):
+        from unittest.mock import patch
+
+        import apple_mail_mcp.cli as cli
+
+        cli._sync_blocked_warned = False
+        synced = threading.Event()
+
+        manager = MagicMock()
+        manager.has_index.return_value = True
+        manager.db_path = db_path
+        manager.index_writer = True
+        manager.last_sync_blocked = None
+
+        def sync_updates():
+            manager.last_sync_blocked = blocked
+            synced.set()
+            return 0
+
+        manager.sync_updates.side_effect = sync_updates
+
+        mcp = MagicMock()
+        mcp.run.side_effect = lambda: probe(synced, manager)
+
+        with (
+            patch(
+                "apple_mail_mcp.index.IndexManager.get_instance",
+                return_value=manager,
+            ),
+            patch("apple_mail_mcp.server.mcp", mcp),
+            patch("apple_mail_mcp.server._cleanup_old_attachments"),
+            patch(
+                "apple_mail_mcp.config.get_lock_retry_seconds",
+                return_value=3600,
+            ),
+        ):
+            cli._run_serve(watch=False)
+
+    def _contender_wins(self, db_path, timeout=2.0):
+        contender = IndexLock(db_path)
+        deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < deadline:
+                if contender.try_acquire():
+                    return True
+                time.sleep(0.02)
+            return False
+        finally:
+            contender.release()
+
+    def test_permission_blocked_writer_releases_lock(self, db_path):
+        state = {}
+
+        def probe(synced, manager):
+            assert synced.wait(timeout=2.0)
+            state["won"] = self._contender_wins(db_path)
+            state["index_writer"] = manager.index_writer
+
+        self._serve(db_path, "permission", probe)
+        assert state["won"] is True, "blocked writer kept the lock"
+        assert state["index_writer"] is False
+
+    def test_healthy_writer_keeps_lock(self, db_path):
+        state = {}
+
+        def probe(synced, manager):
+            assert synced.wait(timeout=2.0)
+            state["won"] = self._contender_wins(db_path, timeout=0.3)
+            state["index_writer"] = manager.index_writer
+
+        self._serve(db_path, None, probe)
+        assert state["won"] is False
+        assert state["index_writer"] is True
